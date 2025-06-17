@@ -1,0 +1,177 @@
+name: CICD Pipeline 
+
+on:
+  push:
+    branches: [ "main" ]     #here you can put DEV=Epic*, TEST=Release*, QA=Release-qa* , PROD=main
+
+jobs:
+  CheckoutCode-Compile:      #Stage-1
+    runs-on: runner1         #runner name -> example linux-runner1
+    
+    steps:
+    - uses: actions/checkout@v4         #Checkout Code
+    - name: Set up JDK 17               #To use maven we need Java to be installed
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+        
+    - name: Code Compile with Maven    #Code Compile
+      run: mvn compile  
+      
+  Security-Check:              #Stage-2
+    runs-on: runner1
+    needs: CheckoutCode-Compile    #Add Dependency
+
+    steps:
+    - uses: actions/checkout@v4    #Checkout Code
+    - name: Trivy Installation     #Scan Using Trivy
+      run: |
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update -y
+        sudo apt-get install trivy -y         
+        
+    - name: Trivy FS Scan   #Trivy File Scan report present in file 'fs-report.json'
+      run: trivy fs --format table -o fs-report.json . 
+      
+      #*Gitleaks is Important Step to Identify if any secret/password is hardcoded in any file
+    - name: Gitleaks Installation  
+      run: sudo apt install gitleaks -y
+	  
+    - name: Gitleaks Code Scan    #Gitleaks Code Scan present in file 'gitleaks-report.json'  
+      run: gitleaks detect source . -r gitleaks-report.json -f json
+      
+  Test-code:                  #Stage-3
+    runs-on: runner1
+    needs: Security-Check     #Add Dependency
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+    - name: Unit Test Cases
+      run: mvn test            #test code using test cases present in the code 
+
+  Build_Project_And_Sonar_Scan:  #Stage-4
+    runs-on: runner1
+    needs: Test-code
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+    
+    - name: Build Project
+      run: mvn -B package --file pom.xml     #-B to run in --batch-mode , background mode
+	  
+    - name: Upload JAR artifact   #Upload .jar file to be used in docker image creation
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-jar
+        path: target/*.jar 
+        
+   #This disables shallow cloning by fetching all commits and branches, not just the latest one.
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0    #Setting it to 0 means: Full Git history is available.
+ 				
+    - name: SonarQube Scan     #refer to sonar-project.properties for details # Default command -> mvn sonar:sonar
+      uses: SonarSource/sonarqube-scan-action@v5.0.0 # Ex: v4.1.0, See the latest version at https://github.com/marketplace/actions/official-sonarqube-scan
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}            #Secret
+        SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}         #Variable
+        
+    - name: SonarQube Quality Gate check           #fetch-depth: 0,  because SonarQube needs full Git history.
+      id: sonarqube-quality-gate-check
+      uses: sonarsource/sonarqube-quality-gate-action@master    # mvn verify sonar:sonar
+      with:
+        pollingTimeoutSec: 600   #10 Min , Ensures GitHub Action waits long enough for SonarQube background tasks
+      env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  Build_Docker_Image_And_Push:  #Stage-5
+    runs-on: runner1
+    needs: Build_Project_And_Sonar_Scan
+    steps:
+    - uses: actions/checkout@v4
+    - name: Download JAR artifact             #Download from path: target/*.jar
+      uses: actions/download-artifact@v4
+      with:
+        name: app-jar
+        path: app                             #This will download JAR to ./app folder
+            
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ vars.DOCKERHUB_USERNAME }}   #Variable
+        password: ${{ secrets.DOCKERHUB_TOKEN }}   #Secret
+	
+      #(Optional but Recommended) -> Enables multi-platform builds  linux/amd64 - (Intel/AMD CPUs), linux/arm64 - Apple M1/M2 Macs
+      # Useful when building images for different CPU architectures
+    - name: Set up QEMU                   
+      uses: docker/setup-qemu-action@v3
+      
+      #Build Docker Image in any platform
+    - name: Set up Docker Buildx  
+      uses: docker/setup-buildx-action@v3
+	  
+    - name: Build and Push Docker image 
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: true
+        tags: ${{ vars.DOCKERHUB_USERNAME }}/bankapp:latest
+        file: ./Dockerfile
+
+  Deploy_to_kubernetes:  #Stage-6
+    runs-on: runner1
+    needs: Build_Docker_Image_And_Push
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4  #Checkout is needed to get k8s yaml manifest file
+    - name: Install AWS CLI
+      run: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
+        
+    - name: Set up kubectl         #kubectl needed to access EKS cluster
+      uses: aws/setup-kubectl@v3
+      with:
+        version: latest
+		
+    - name: Configure kubeconfig    # /.kube/config - file has all cluster info, it is confidential so keep in the secret - EKS_KUBECONFIG  
+      run: |
+        mkdir -p $HOME/.kube      
+        echo "${{ secrets.EKS_KUBECONFIG }}" > $HOME/.kube/config
+      		
+    - name: Deploy to EKS
+      run: |
+        kubectl apply -f ds.yml          
+      #ds.yml has deployment. service configuration
+
+    - name: Wait for Deployment to Stabilize
+      run: |
+        kubectl rollout status deployment/bankapp --timeout=120s  
+      # 2 mins timeout for stabilization
+    
+    - name: Check Deployment Status
+      run: |
+        kubectl get all
